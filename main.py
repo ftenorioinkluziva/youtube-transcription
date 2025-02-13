@@ -1,8 +1,9 @@
 from fastapi import FastAPI, HTTPException
-from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.formatters import TextFormatter
 from pydantic import BaseModel
-from typing import Optional
+import httpx
+import re
+import json
+from typing import Optional, List
 
 app = FastAPI()
 
@@ -10,58 +11,85 @@ class VideoRequest(BaseModel):
     video_id: str
     language: Optional[str] = None
 
+class TranscriptResponse(BaseModel):
+    text: str
+    duration: float
+    offset: float
+    lang: str
+
+USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36'
+
 @app.post("/transcribe")
 async def transcribe_video(request: VideoRequest):
     try:
-        # Primeiro, vamos listar todas as legendas disponíveis
-        transcript_list = YouTubeTranscriptApi.list_transcripts(request.video_id)
-        
-        try:
-            # Tenta pegar a legenda no idioma especificado
-            if request.language:
-                transcript = transcript_list.find_transcript([request.language])
-            else:
-                # Se não especificou idioma, tenta pegar qualquer uma disponível
-                transcript = transcript_list.find_manually_created_transcript()
-                if not transcript:
-                    transcript = transcript_list.find_generated_transcript()
-        
-            formatted_transcript = ''
-            for entry in transcript.fetch():
-                formatted_transcript += f"[{entry['start']:.2f}s] {entry['text']}\n"
-            
-            return {
-                "video_id": request.video_id,
-                "transcript": formatted_transcript,
-                "language": transcript.language_code,
-                "success": True
+        # Faz a requisição para a página do vídeo
+        async with httpx.AsyncClient() as client:
+            headers = {
+                'User-Agent': USER_AGENT
             }
+            if request.language:
+                headers['Accept-Language'] = request.language
+
+            response = await client.get(
+                f'https://www.youtube.com/watch?v={request.video_id}',
+                headers=headers
+            )
             
-        except Exception:
-            # Se não encontrou no idioma especificado, lista os idiomas disponíveis
-            available_transcripts = transcript_list.manual_transcripts
-            available_transcripts.update(transcript_list.generated_transcripts)
+            html = response.text
             
-            available_languages = [
-                {"code": t.language_code, "name": t.language} 
-                for t in available_transcripts.values()
-            ]
+            # Procura pelos dados de legendas
+            captions_data = html.split('"captions":')[1].split(',"videoDetails')[0]
+            captions = json.loads(captions_data)
+            
+            if 'playerCaptionsTracklistRenderer' not in captions:
+                raise Exception("No captions available")
+                
+            caption_tracks = captions['playerCaptionsTracklistRenderer'].get('captionTracks', [])
+            
+            if not caption_tracks:
+                raise Exception("No caption tracks found")
+                
+            # Pega a primeira legenda ou a do idioma especificado
+            target_track = None
+            if request.language:
+                target_track = next(
+                    (track for track in caption_tracks if track['languageCode'] == request.language),
+                    caption_tracks[0]
+                )
+            else:
+                target_track = caption_tracks[0]
+                
+            # Obtém o XML da legenda
+            transcript_response = await client.get(
+                target_track['baseUrl'],
+                headers=headers
+            )
+            
+            transcript_xml = transcript_response.text
+            
+            # Parse do XML para extrair o texto
+            pattern = r'<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>'
+            matches = re.finditer(pattern, transcript_xml)
+            
+            transcript = []
+            for match in matches:
+                transcript.append({
+                    "text": match.group(3),
+                    "duration": float(match.group(2)),
+                    "offset": float(match.group(1)),
+                    "lang": target_track['languageCode']
+                })
             
             return {
                 "video_id": request.video_id,
-                "success": False,
-                "error": "Legenda não encontrada no idioma especificado",
-                "available_languages": available_languages
+                "transcript": transcript,
+                "success": True,
+                "language": target_track['languageCode']
             }
             
     except Exception as e:
-        available_languages = []
-        error_message = "Não foi possível encontrar legendas para este vídeo. " + \
-                       "Verifique se o vídeo tem legendas habilitadas."
-        
         return {
             "video_id": request.video_id,
             "success": False,
-            "error": error_message,
-            "available_languages": available_languages
+            "error": str(e)
         }
