@@ -11,12 +11,6 @@ class VideoRequest(BaseModel):
     video_id: str
     language: Optional[str] = None
 
-class TranscriptResponse(BaseModel):
-    text: str
-    duration: float
-    offset: float
-    lang: str
-
 USER_AGENT = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/85.0.4183.83 Safari/537.36'
 
 @app.post("/transcribe")
@@ -37,59 +31,93 @@ async def transcribe_video(request: VideoRequest):
             
             html = response.text
             
-            # Procura pelos dados de legendas
-            captions_data = html.split('"captions":')[1].split(',"videoDetails')[0]
-            captions = json.loads(captions_data)
-            
-            if 'playerCaptionsTracklistRenderer' not in captions:
-                raise Exception("No captions available")
+            # Tenta encontrar os dados de legendas de diferentes maneiras
+            try:
+                # Primeira tentativa: procurar por captions
+                if '"captions":' not in html:
+                    return {
+                        "video_id": request.video_id,
+                        "success": False,
+                        "error": "No captions data found in the video page"
+                    }
+
+                # Divide e pega a parte que contém os dados das legendas
+                captions_parts = html.split('"captions":')
+                if len(captions_parts) < 2:
+                    return {
+                        "video_id": request.video_id,
+                        "success": False,
+                        "error": "Could not parse captions data"
+                    }
+
+                # Pega o JSON das legendas
+                captions_json = captions_parts[1].split(',"videoDetails')[0].strip()
+                captions = json.loads(captions_json)
                 
-            caption_tracks = captions['playerCaptionsTracklistRenderer'].get('captionTracks', [])
-            
-            if not caption_tracks:
-                raise Exception("No caption tracks found")
+                if not captions or 'playerCaptionsTracklistRenderer' not in captions:
+                    return {
+                        "video_id": request.video_id,
+                        "success": False,
+                        "error": "No captions renderer found"
+                    }
+
+                caption_tracks = captions['playerCaptionsTracklistRenderer'].get('captionTracks', [])
                 
-            # Pega a primeira legenda ou a do idioma especificado
-            target_track = None
-            if request.language:
-                target_track = next(
-                    (track for track in caption_tracks if track['languageCode'] == request.language),
-                    caption_tracks[0]
-                )
-            else:
+                if not caption_tracks:
+                    return {
+                        "video_id": request.video_id,
+                        "success": False,
+                        "error": "No caption tracks available"
+                    }
+
+                # Pega a primeira legenda disponível
                 target_track = caption_tracks[0]
                 
-            # Obtém o XML da legenda
-            transcript_response = await client.get(
-                target_track['baseUrl'],
-                headers=headers
-            )
-            
-            transcript_xml = transcript_response.text
-            
-            # Parse do XML para extrair o texto
-            pattern = r'<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>'
-            matches = re.finditer(pattern, transcript_xml)
-            
-            transcript = []
-            for match in matches:
-                transcript.append({
-                    "text": match.group(3),
-                    "duration": float(match.group(2)),
-                    "offset": float(match.group(1)),
-                    "lang": target_track['languageCode']
-                })
-            
-            return {
-                "video_id": request.video_id,
-                "transcript": transcript,
-                "success": True,
-                "language": target_track['languageCode']
-            }
-            
+                # Obtém o XML da legenda
+                transcript_response = await client.get(
+                    target_track['baseUrl'],
+                    headers=headers
+                )
+                
+                transcript_xml = transcript_response.text
+                
+                # Parse do XML para extrair o texto
+                pattern = r'<text start="([^"]*)" dur="([^"]*)">([^<]*)<\/text>'
+                matches = re.finditer(pattern, transcript_xml)
+                
+                transcript = []
+                for match in matches:
+                    transcript.append({
+                        "text": match.group(3),
+                        "duration": float(match.group(2)),
+                        "offset": float(match.group(1)),
+                        "lang": target_track['languageCode']
+                    })
+                
+                if not transcript:
+                    return {
+                        "video_id": request.video_id,
+                        "success": False,
+                        "error": "Could not extract transcript text"
+                    }
+
+                return {
+                    "video_id": request.video_id,
+                    "transcript": transcript,
+                    "success": True,
+                    "language": target_track['languageCode']
+                }
+                
+            except json.JSONDecodeError as e:
+                return {
+                    "video_id": request.video_id,
+                    "success": False,
+                    "error": f"Failed to parse JSON: {str(e)}"
+                }
+                
     except Exception as e:
         return {
             "video_id": request.video_id,
             "success": False,
-            "error": str(e)
+            "error": f"Error processing video: {str(e)}"
         }
